@@ -32,7 +32,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const sourceStreamName = "containerd.io-source"
+const SourceStreamName = "containerd.io-source"
 
 // Mount to the provided target.
 func (m *Mount) mount(target string) (retErr error) {
@@ -101,7 +101,7 @@ func (m *Mount) mount(target string) (retErr error) {
 	// Add an Alternate Data Stream to record the layer source.
 	// See https://docs.microsoft.com/en-au/archive/blogs/askcore/alternate-data-streams-in-ntfs
 	// for details on Alternate Data Streams.
-	if err := os.WriteFile(filepath.Clean(target)+":"+sourceStreamName, []byte(m.Source), 0666); err != nil {
+	if err := os.WriteFile(filepath.Clean(target)+":"+SourceStreamName, []byte(m.Source), 0666); err != nil {
 		return fmt.Errorf("failed to record source for layer %s: %w", m.Source, err)
 	}
 
@@ -129,11 +129,11 @@ func (m *Mount) GetParentPaths() ([]string, error) {
 // Unmount the mount at the provided path
 func Unmount(mount string, flags int) error {
 	mount = filepath.Clean(mount)
-	adsFile := mount + ":" + sourceStreamName
+	adsFile := mount + ":" + SourceStreamName
 	var layerPath string
 
 	if _, err := os.Lstat(adsFile); err == nil {
-		layerPathb, err := os.ReadFile(mount + ":" + sourceStreamName)
+		layerPathb, err := os.ReadFile(mount + ":" + SourceStreamName)
 		if err != nil {
 			return fmt.Errorf("failed to retrieve source for layer %s: %w", mount, err)
 		}
