@@ -30,6 +30,7 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
+	"github.com/distribution/reference"
 	"github.com/urfave/cli/v2"
 )
 
@@ -69,11 +70,18 @@ var listCommand = &cli.Command{
 			Aliases: []string{"q"},
 			Usage:   "Print only the image refs",
 		},
+		&cli.BoolFlag{
+			Name:    "all",
+			Aliases: []string{"a"},
+			Usage:   "Show all image refs including repo digests and image IDs (only relevant for the k8s.io namespace, where the CRI plugin creates multiple refs per image)",
+		},
 	},
 	Action: func(cliContext *cli.Context) error {
 		var (
-			filters = cliContext.Args().Slice()
-			quiet   = cliContext.Bool("quiet")
+			filters   = cliContext.Args().Slice()
+			quiet     = cliContext.Bool("quiet")
+			showAll   = cliContext.Bool("all")
+			namespace = cliContext.String("namespace")
 		)
 		client, ctx, cancel, err := commands.NewClient(cliContext)
 		if err != nil {
@@ -88,6 +96,15 @@ var listCommand = &cli.Command{
 		if err != nil {
 			return fmt.Errorf("failed to list images: %w", err)
 		}
+
+		// In the k8s.io namespace the CRI plugin writes three refs per image:
+		// repo:tag, repo@digest, and sha256:configID. Only show repo:tag refs
+		// by default so the output matches what crictl and nerdctl show.
+		// Use --all / -a to see all refs.
+		if namespace == "k8s.io" && !showAll {
+			imageList = deduplicateCRIImages(imageList)
+		}
+
 		if quiet {
 			for _, image := range imageList {
 				fmt.Println(image.Name)
@@ -337,10 +354,60 @@ var removeCommand = &cli.Command{
 		var (
 			exitErr    error
 			imageStore = client.ImageService()
+			namespace  = cliContext.String("namespace")
 		)
-		for i, target := range cliContext.Args().Slice() {
+
+		// In the k8s.io namespace the CRI plugin stores three refs per image
+		// (repo:tag, repo@digest, sha256:configID). When a user removes an image
+		// by its repo:tag ref, also remove the sibling refs that share the same
+		// target digest so the image is fully cleaned up in one operation.
+		//
+		// For each requested ref we do two linear scans of the image store:
+		//   Pass 1 — find the target by name, grab its digest, break early.
+		//   Pass 2 — collect every ref that shares that digest.
+		// This is at most O(2n) per target with no extra map allocations.
+		var targets []string
+		if namespace == "k8s.io" {
+			allImages, err := imageStore.List(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to list images for CRI sibling lookup: %w", err)
+			}
+			seen := make(map[string]struct{})
+			for _, target := range cliContext.Args().Slice() {
+				// Pass 1: find the digest for this target name.
+				var targetDigest string
+				for _, img := range allImages {
+					if img.Name == target {
+						targetDigest = img.Target.Digest.String()
+						break
+					}
+				}
+				if targetDigest == "" {
+					// Not found in store; pass through so the delete call
+					// surfaces the appropriate "not found" error.
+					if _, already := seen[target]; !already {
+						targets = append(targets, target)
+						seen[target] = struct{}{}
+					}
+					continue
+				}
+				// Pass 2: collect all refs sharing the same target digest.
+				for _, img := range allImages {
+					if img.Target.Digest.String() == targetDigest {
+						if _, already := seen[img.Name]; !already {
+							targets = append(targets, img.Name)
+							seen[img.Name] = struct{}{}
+						}
+					}
+				}
+			}
+		} else {
+			targets = cliContext.Args().Slice()
+		}
+
+		for i, target := range targets {
 			var opts []images.DeleteOpt
-			if cliContext.Bool("sync") && i == cliContext.NArg()-1 {
+			if cliContext.Bool("sync") && i == len(targets)-1 {
 				opts = append(opts, images.SynchronousDelete())
 			}
 			if err := imageStore.Delete(ctx, target, opts...); err != nil {
@@ -430,4 +497,56 @@ var pruneCommand = &cli.Command{
 		}
 		return nil
 	},
+}
+
+// deduplicateCRIImages filters an image list to remove CRI-managed duplicate refs.
+//
+// When the CRI plugin pulls an image into the k8s.io namespace it writes three
+// named refs for the same underlying image:
+//
+//   - repo:tag        (e.g. docker.io/library/nginx:1.25)
+//   - repo@digest     (e.g. docker.io/library/nginx@sha256:abc...)
+//   - sha256:configID (e.g. sha256:eeb6ee3f...)
+//
+// All three point to the same target digest. Tools like crictl deduplicate via
+// the CRI ListImages API; ctr reads the raw image store and would show all three.
+// This function keeps only the repo:tag ref for each target digest. If no tagged
+// ref exists for a given digest (e.g. a genuinely untagged/dangling image), the
+// first ref seen is kept so nothing is silently dropped.
+func deduplicateCRIImages(imageList []images.Image) []images.Image {
+	// Track which target digests we have already found a tagged ref for.
+	taggedDigests := make(map[string]struct{})
+	// Collect refs that have no tag, keyed by target digest, as fallback.
+	untaggedByDigest := make(map[string]images.Image)
+
+	var result []images.Image
+	for _, img := range imageList {
+		parsed, err := reference.ParseAnyReference(img.Name)
+		if err != nil {
+			// Unparseable ref — include it as-is to avoid silently dropping it.
+			result = append(result, img)
+			continue
+		}
+		if _, ok := parsed.(reference.Tagged); ok {
+			// This is a repo:tag ref — always include it.
+			result = append(result, img)
+			taggedDigests[img.Target.Digest.String()] = struct{}{}
+		} else {
+			// repo@digest or sha256:configID — record as fallback.
+			d := img.Target.Digest.String()
+			if _, seen := untaggedByDigest[d]; !seen {
+				untaggedByDigest[d] = img
+			}
+		}
+	}
+
+	// For any digest that had no tagged ref, include the fallback so that
+	// genuinely dangling images are still visible.
+	for d, img := range untaggedByDigest {
+		if _, hasTag := taggedDigests[d]; !hasTag {
+			result = append(result, img)
+		}
+	}
+
+	return result
 }
